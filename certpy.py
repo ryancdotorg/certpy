@@ -142,7 +142,7 @@ class NameAttributes:
         return x509.Name(list(self.attribs.values()))
 
 class SANs:
-    def __init__(self, include_ips_as_dns_names=True):
+    def __init__(self, include_ips_as_dns_names=False):
         self.include_ips_as_dns_names = include_ips_as_dns_names
         self.hosts, self.ips = [], []
 
@@ -307,7 +307,8 @@ class CertAttribs:
             if duration is not None:
                 not_after = not_before + duration
             else:
-                not_after = datetime.now() + timedelta(seconds=int(1*YEAR))
+                # See https://support.apple.com/en-us/HT210176
+                not_after = datetime.now() + timedelta(days=820)
 
         if ca is not None:
             try:
@@ -378,7 +379,7 @@ class CertAttribs:
     def pub(self): return self.key.public_key()
 
 
-class CACert(CertAttribs):
+class RootCACert(CertAttribs):
     def __init__(self, *args, **kwarg):
         super().__init__(*args, **kwarg)
         self.ca = True
@@ -386,28 +387,43 @@ class CACert(CertAttribs):
         # key usages
         self.key_cert_sign = True
 
+
 class OCSPSignerCert(CertAttribs):
     def __init__(self, *args, **kwarg):
         super().__init__(*args, **kwarg)
         self.key_cert_sign = True
 
+
 class CRLSignerCert(CertAttribs):
     def __init__(self, *args, **kwarg):
         super().__init__(*args, **kwarg)
 
+
 class ServerCert(CertAttribs):
     def __init__(self, *args, **kwarg):
         super().__init__(*args, **kwarg)
+
+        # Basic Constraints
         self.ca = False
         self.pathlen = None
-        # RSA keys can be used for key agreement (but probably shouldn't)
-        if isinstance(self.pub, rsa.RSAPublicKey):
-            self.key_agreement = True
+
+        # Basic Key Usage
         self.digital_signature = True
+        if isinstance(self.pub, rsa.RSAPublicKey):
+            # RSA keys can be used for key encipherment (but shouldn't)
+            self.key_encipherment = True
+        # XXX Does any software require this?
+        #else:
+        #    self.key_agreement = True
+
+        # Extended Key Usage
         self.server_auth = True
+
+        # Subject Alternative Names
         self.sans = SANs()
 
-class SelfSignedServerCert(ServerCert, CACert):
+
+class SelfSignedServerCert(ServerCert, RootCACert):
     def __init__(self, *args, **kwarg):
         super().__init__(*args, **kwarg)
         self.ca = True
