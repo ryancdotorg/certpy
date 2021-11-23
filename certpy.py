@@ -30,8 +30,9 @@ from cryptography.hazmat.primitives.serialization import ParameterFormat
 from cryptography.hazmat.primitives.serialization import BestAvailableEncryption
 
 PEM = Encoding.PEM
+PKCS1 = PrivateFormat.TraditionalOpenSSL
 PKCS3 = ParameterFormat.PKCS3
-TraditionalOpenSSL = PrivateFormat.TraditionalOpenSSL
+PKCS8 = PrivateFormat.PKCS8
 OCSP = x509.oid.AuthorityInformationAccessOID.OCSP
 CA_ISSUERS = x509.oid.AuthorityInformationAccessOID.CA_ISSUERS
 
@@ -92,13 +93,9 @@ def x509_ip(ip):
 def x509_net(net):
     return x509.IPAddress(ipaddress.ip_network(net))
 
-@mapable
-def x509_dns(dns):
-    return x509.DNSName(dns)
-
-@mapable
-def x509_uri(uri):
-    return x509.UniformResourceIdentifier(uri)
+x509_dns = mapable(x509.DNSName)
+x509_uri = mapable(x509.UniformResourceIdentifier)
+x509_email = mapable(x509.RFC822Name)
 
 @mapable
 def x509_host(host, force_dns_name=False):
@@ -144,22 +141,26 @@ class NameAttributes:
 class SANs:
     def __init__(self, include_ips_as_dns_names=False):
         self.include_ips_as_dns_names = include_ips_as_dns_names
-        self.hosts, self.ips = [], []
+        self.hosts, self.ips, self.emails = [], [], []
 
     def __len__(self):
-        return len(self.hosts) + len(self.ips)
+        return len(self.hosts) + len(self.ips) + len(self.emails)
 
     def _encode(self, san):
-        try:
-            item = x509_ip(san)
-            if include_ips_as_dns_names:
-                alt = x509_dns(san)
-                return ((self.ips, item), (self.hosts, alt))
-            else:
-                return ((self.ips, item),)
-        except ValueError:
-            item = x509_dns(san)
-            return ((self.hosts, item),)
+        if '@' in san:
+            # Assume anything with an @ is an email address :shrug:
+            return (self.emails, x509_email(san))
+        else:
+            try:
+                item = x509_ip(san)
+                if self.include_ips_as_dns_names:
+                    alt = x509_dns(san)
+                    return ((self.ips, item), (self.hosts, alt))
+                else:
+                    return ((self.ips, item),)
+            except ValueError:
+                item = x509_dns(san)
+                return ((self.hosts, item),)
 
     def add(self, san):
         for items, encoded in self._encode(san):
@@ -181,7 +182,8 @@ class SANs:
         return True
 
     def output(self):
-        return x509.SubjectAlternativeName(self.hosts + self.ips)
+        return x509.SubjectAlternativeName(self.hosts + self.ips + self.emails)
+
 
 class PrivateKeyAlgorithm(metaclass=abc.ABCMeta):
     @abc.abstractmethod
@@ -194,8 +196,6 @@ class ED25519(PrivateKeyAlgorithm):
 class ED448(PrivateKeyAlgorithm):
     def __call__(self):
         return ed448.Ed448PrivateKey.generate()
-
-
 
 ### RSA
 @mapable
@@ -242,12 +242,12 @@ for name in dir(NameOID):
 '''
 
 class CertAttribs:
-    def __init__(self, key_algo=SECP256R1, *args, **kwarg):
+    def __init__(self, pub=None, key=None, *args, **kwarg):
         super().__init__(*args, **kwarg)
-        if not isinstance(key_algo, PrivateKeyAlgorithm):
-            raise TypeError('key_algo must be an instance of PrivateKeyAlgorithm')
 
-        self.key_algo = key_algo
+        self._pub = pub
+        self.key = key
+
         self.subject = NameAttributes()
 
         self.ca = False
@@ -265,6 +265,7 @@ class CertAttribs:
             'data_encipherment', 'key_agreement', 'key_cert_sign',
             'crl_sign', 'encipher_only', 'decipher_only'
         )
+
         for usage in usages: setattr(self, usage, False)
         for k, _ in eku_oids: setattr(self, k, False)
 
@@ -287,13 +288,10 @@ class CertAttribs:
         pathlen = self.pathlen if self.ca else None
         return x509.BasicConstraints(ca=self.ca, path_length=pathlen)
 
-    def sign(self, ca, key, *, hash_algo=SHA256, duration=None, not_before=None, not_after=None):
+    def build(self, ca=None, key=None, duration=None, not_before=None, not_after=None):
         # check arguments
         if all(map(lambda x: x is not None, (duration, not_before, not_after))):
             raise ValueError('At least one of (`duration`, `not_before`, `not_after`) must be None!')
-
-        if not issubclass(hash_algo, HashAlgorithm):
-            raise TypeError('hash_algo must be a subclass of HashAlgorithm')
 
         # figure out start time
         if not_before is None:
@@ -318,6 +316,9 @@ class CertAttribs:
                 aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key())
         else:
             aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key())
+
+        if len(self.sans.emails) > 0:
+            self.email_protection = True
 
         crt = x509.CertificateBuilder()
         crt = crt.public_key(self.pub)
@@ -365,6 +366,15 @@ class CertAttribs:
         if len(self.sans):
             crt = crt.add_extension(self.sans.output(), not bool(len(self.subject)))
 
+        return crt
+
+    def sign(self, ca, key, *, hash_algo=SHA256, duration=None, not_before=None, not_after=None):
+        # check arguments
+        if not issubclass(hash_algo, HashAlgorithm):
+            raise TypeError('hash_algo must be a subclass of HashAlgorithm')
+
+        crt = self.build(ca, key, duration, not_before, not_after)
+
         return crt.sign(key, hash_algo(), default_backend())
 
     def output(self, builder):
@@ -376,7 +386,13 @@ class CertAttribs:
         elif key == 'content_commitment': return self.non_repudiation
 
     @property
-    def pub(self): return self.key.public_key()
+    def pub(self):
+        return self._pub if self._pub else self.key.public_key()
+
+    @pub.setter
+    def pub(self, value):
+        self.key = None
+        self._pub = value
 
 
 class RootCACert(CertAttribs):
@@ -384,8 +400,18 @@ class RootCACert(CertAttribs):
         super().__init__(*args, **kwarg)
         self.ca = True
         self.pathlen = 0
+
         # key usages
         self.key_cert_sign = True
+
+    def sign(self, *, hash_algo=SHA256, duration=None, not_before=None, not_after=None):
+        # check arguments
+        if not issubclass(hash_algo, HashAlgorithm):
+            raise TypeError('hash_algo must be a subclass of HashAlgorithm')
+
+        crt = self.build(None, self.key, duration, not_before, not_after)
+
+        return crt.sign(self.key, hash_algo(), default_backend())
 
 
 class OCSPSignerCert(CertAttribs):
@@ -412,9 +438,6 @@ class ServerCert(CertAttribs):
         if isinstance(self.pub, rsa.RSAPublicKey):
             # RSA keys can be used for key encipherment (but shouldn't)
             self.key_encipherment = True
-        # XXX Does any software require this?
-        #else:
-        #    self.key_agreement = True
 
         # Extended Key Usage
         self.server_auth = True
