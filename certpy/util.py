@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
-
 import warnings
 
 import re
 import os
+import sys
 import abc
 import ssl
 import argparse
@@ -11,10 +10,10 @@ import ipaddress
 import functools
 
 from hashlib import sha256
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections.abc import Iterable
 
-
+# the safe stuff
 from cryptography import x509
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
@@ -37,6 +36,17 @@ OCSP = x509.oid.AuthorityInformationAccessOID.OCSP
 CA_ISSUERS = x509.oid.AuthorityInformationAccessOID.CA_ISSUERS
 
 YEAR = (365.2425*86400)
+
+__all__ = [
+    'CertBase',
+    'NameAttributes', 'SANs',
+
+    'ED25519', 'ED448',
+    'RSA2048', 'RSA3072', 'RSA4096',
+    'SECP256R1', 'SECP384R1', 'SECP521R1',
+
+#    'PEM', 'PKCS1', 'PKCS3', 'PKCS8', 'NoEncryption', 'BestAvailableEncryption',
+]
 
 def isiterable(x):
     return not isinstance(x, (str, bytes)) and isinstance(x, Iterable)
@@ -65,6 +75,10 @@ def mapable(fn):
             raise TypeError('Unexpected positional argument(s)!')
 
     return wrapped
+
+def getattrs(obj, *args):
+    fn = mapable(partial(getattr, obj))
+    return fn(*args)
 
 def mapped(fn, *args):
     mapper = mapable(fn)
@@ -199,23 +213,21 @@ class ED448(PrivateKeyAlgorithm):
 
 ### RSA
 @mapable
-def rsa_factory(bits, *args, backend=default_backend, public_exponent=65537):
+def rsa_factory(bits, *, backend=default_backend, public_exponent=65537):
     if bits < 2048 or bits > 15360 or bits % 512 != 0:
         raise ValueError(f'Invalid key size `{bits}`!')
 
     def generate(self, public_exponent=public_exponent):
         return rsa.generate_private_key(public_exponent, bits, backend())
 
-    return type(f'RSA{bits}', (PrivateKeyAlgorithm,), {
-        '__call__': generate,
-    })()
+    return type(f'RSA{bits}', (PrivateKeyAlgorithm,), {'__call__': generate})()
 
 key_sizes = (2048, 3072, 4096)
 RSA2048, RSA3072, RSA4096 = rsa_factory(key_sizes)
 
 ### ECDSA
 @mapable
-def ecdsa_factory(curve, *args, backend=default_backend):
+def ecdsa_factory(curve, *, backend=default_backend):
     curve = curve()
     if not isinstance(curve, ec.EllipticCurve):
         raise ValueError(f'Invalid curve `{type(curve)}`!')
@@ -233,15 +245,7 @@ for eku in dir(ExtendedKeyUsageOID):
         k, v = eku.lower(), getattr(ExtendedKeyUsageOID, eku)
         eku_oids.append((k, v))
 
-'''
-name_oids = []
-for name in dir(NameOID):
-    if name[0] != '_':
-        k, v = name.lower(), NameOID[k]
-        name_oids.append((k, v))
-'''
-
-class CertAttribs:
+class CertBase:
     def __init__(self, pub=None, key=None, *args, **kwarg):
         super().__init__(*args, **kwarg)
 
@@ -275,7 +279,7 @@ class CertAttribs:
             if getattr(self, k):
                 ekus.append(v)
 
-        return x509.ExtendedKeyUsage(ekus)
+        return x509.ExtendedKeyUsage(ekus) if len(ekus) else None
 
     def _key_usage(self):
         return x509.KeyUsage(
@@ -298,7 +302,8 @@ class CertAttribs:
             if duration is not None and not_after is not None:
                 not_before = not_after - duration
             else:
-                not_before = datetime.now() - timedelta(seconds=60)
+                now = datetime.now(timezone.utc)
+                not_before = now - timedelta(seconds=60)
 
         # figure out expiry time
         if not_after is None:
@@ -306,7 +311,8 @@ class CertAttribs:
                 not_after = not_before + duration
             else:
                 # See https://support.apple.com/en-us/HT210176
-                not_after = datetime.now() + timedelta(days=820)
+                now = datetime.now(timezone.utc)
+                not_after = now + timedelta(days=820)
 
         if ca is not None:
             try:
@@ -327,11 +333,17 @@ class CertAttribs:
         crt = crt.serial_number(x509.random_serial_number())
         crt = crt.not_valid_before(not_before)
         crt = crt.not_valid_after(not_after)
-        crt = crt.add_extension(x509.SubjectKeyIdentifier.from_public_key(self.pub), False)
-        crt = crt.add_extension(aki, False)
-        crt = crt.add_extension(self._key_usage(), True)
-        crt = crt.add_extension(self._extended_key_usage(), False)
-        crt = crt.add_extension(self._basic_constraints(), not self.ca)
+
+        def add_extension(k, v):
+            nonlocal crt
+            if k is not None:
+                crt = crt.add_extension(k, v)
+
+        add_extension(x509.SubjectKeyIdentifier.from_public_key(self.pub), False)
+        add_extension(aki, False)
+        add_extension(self._key_usage(), True)
+        add_extension(self._extended_key_usage(), False)
+        add_extension(self._basic_constraints(), True)
 
         if len(self.crl_distribution_points) > 0:
             full_namess = map(x509.UniformResourceIdentifier, self.crl_distribution_points)
@@ -393,70 +405,3 @@ class CertAttribs:
     def pub(self, value):
         self.key = None
         self._pub = value
-
-
-class RootCACert(CertAttribs):
-    def __init__(self, *args, **kwarg):
-        super().__init__(*args, **kwarg)
-        self.ca = True
-        self.pathlen = 0
-
-        # key usages
-        self.key_cert_sign = True
-
-    def sign(self, *, hash_algo=SHA256, duration=None, not_before=None, not_after=None):
-        # check arguments
-        if not issubclass(hash_algo, HashAlgorithm):
-            raise TypeError('hash_algo must be a subclass of HashAlgorithm')
-
-        crt = self.build(None, self.key, duration, not_before, not_after)
-
-        return crt.sign(self.key, hash_algo(), default_backend())
-
-
-class OCSPSignerCert(CertAttribs):
-    def __init__(self, *args, **kwarg):
-        super().__init__(*args, **kwarg)
-        self.key_cert_sign = True
-
-
-class CRLSignerCert(CertAttribs):
-    def __init__(self, *args, **kwarg):
-        super().__init__(*args, **kwarg)
-
-
-class ServerCert(CertAttribs):
-    def __init__(self, *args, **kwarg):
-        super().__init__(*args, **kwarg)
-
-        # Basic Constraints
-        self.ca = False
-        self.pathlen = None
-
-        # Basic Key Usage
-        self.digital_signature = True
-        if isinstance(self.pub, rsa.RSAPublicKey):
-            # RSA keys can be used for key encipherment (but shouldn't)
-            self.key_encipherment = True
-
-        # Extended Key Usage
-        self.server_auth = True
-
-        # Subject Alternative Names
-        self.sans = SANs()
-
-
-class SelfSignedServerCert(ServerCert, RootCACert):
-    def __init__(self, *args, **kwarg):
-        super().__init__(*args, **kwarg)
-        self.ca = True
-        self.pathlen = 0
-
-
-if __name__ == '__main__':
-    c = SelfSignedServerCert(RSA2048)
-    c.sans.add('example.com')
-    c.subject.common_name = 'certificate'
-    print(c.pub)
-    signed = c.sign(None, c.key)
-    print(signed.public_bytes(encoding=PEM).decode())
