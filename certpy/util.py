@@ -249,6 +249,7 @@ class CertBase:
     def __init__(self, pub=None, key=None, *args, **kwarg):
         super().__init__(*args, **kwarg)
 
+        self._signed = None
         self._pub = pub
         self.key = key
 
@@ -386,8 +387,8 @@ class CertBase:
             raise TypeError('hash_algo must be a subclass of HashAlgorithm')
 
         crt = self.build(ca, key, duration, not_before, not_after)
-
-        return crt.sign(key, hash_algo(), default_backend())
+        self._signed = crt.sign(key, hash_algo(), default_backend())
+        return self._signed
 
     def output(self, builder):
         builder.public_key(self.pub)

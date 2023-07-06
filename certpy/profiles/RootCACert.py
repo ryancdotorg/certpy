@@ -13,10 +13,4 @@ class RootCACert(CertBase):
         self.key_cert_sign = True
 
     def sign(self, *, hash_algo=SHA256, duration=None, not_before=None, not_after=None):
-        # check arguments
-        if not issubclass(hash_algo, HashAlgorithm):
-            raise TypeError('hash_algo must be a subclass of HashAlgorithm')
-
-        crt = self.build(None, self.key, duration, not_before, not_after)
-
-        return crt.sign(self.key, hash_algo(), default_backend())
+        return CertBase.sign(self, None, self.key)
